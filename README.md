@@ -114,7 +114,7 @@ dementia-typer gives each of these questions its own component. Each component h
 | Models | `majority` baseline, `logreg`, `forest` (default candidates), `boosting` (optional) |
 | Offline mode | Synthetic tables, all commands and all tests. No download and no key |
 | Safety | Participant-grouped splits. Selection on training participants only. CDR only in the ceiling set |
-| Tests | **55** unit tests (`pytest`), 1 more skips without the optional `shap` package |
+| Tests | **55** pass in CI (`.[dev]` only). 1 more test skips without the optional `shap` package |
 
 ```mermaid
 flowchart LR
@@ -497,8 +497,7 @@ All numbers below come from this repository. The model numbers use **synthetic d
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests (local, Python 3.13) | **55 passed, 1 skipped** (SHAP) | `pytest -q` |
-| Unit tests (clean venv with `.[dev]` only, as in CI) | **55 passed, 1 skipped** | `pip install -e ".[dev]" && pytest -q` |
+| Unit tests | CI installs only `.[dev]`: **55 passed**, 1 skipped (`explain` extra, SHAP) | `pip install -e ".[dev]" && pytest -q` |
 | Join and rules (synthetic) | 879 visits, 300 participants, 724 visits with an MR session in 365 days, 0 unmapped texts | `dementia-typer validate` |
 | Leak check, forest macro-F1 (synthetic) | Visit split 0.711, participant split 0.628, gap 0.082 | `dementia-typer leakage` |
 | Split sizes (synthetic) | 240 training and 60 test participants (705 and 174 visits) | `dementia-typer train` |
@@ -533,7 +532,7 @@ Read these problems before you use dementia-typer for a publication.
 | 4 | Calibration | The selected pipeline is not calibrated. ECE is 0.03–0.11 on synthetic data | Do not read the probabilities as risks |
 | 5 | Cohort bias | OASIS-3 participants are volunteers from one research center | Do not generalize to other populations without external validation |
 | 6 | Column names | The FreeSurfer export uses other column names in some releases | Rename the columns to the names in `data/README.md` |
-| 7 | Boosting speed | `HistGradientBoostingClassifier` was very slow on a loaded Windows host with 5 classes | It is not a default candidate. Add it with `--models` on a quiet machine |
+| 7 | Boosting speed | `HistGradientBoostingClassifier` with 5 classes and a full grid is slow on a CPU | It is not a default candidate. Add it with `--models` when you have the time |
 | 8 | Visit order | Visits of one participant are not independent. The bootstrap resamples participants, but the metrics weight participants by their visit count | Report a last-visit evaluation for each participant if you need one weight for each person |
 | 9 | Inner CV | The grid search uses `GroupKFold` without stratification. A small group can be absent from an inner fold | Use fewer folds for small datasets |
 

@@ -1,0 +1,33 @@
+# secrets and local config
+.env
+.env.*
+!.env.example
+
+# OASIS-3 data is under a data use agreement: never commit it
+/data/*
+!/data/README.md
+*.db
+*.parquet
+*.nii
+*.nii.gz
+*.mgz
+
+# models, runs and reports
+/runs/
+/outputs/
+/models/
+*.joblib
+*.pkl
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/

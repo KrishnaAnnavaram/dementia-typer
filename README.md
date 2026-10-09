@@ -73,6 +73,7 @@ This README is the **one location that explains all of dementia-typer**. It give
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one visit](#42-the-life-cycle-of-one-visit)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Tables and the visit-to-MRI join](#5-tables-and-the-visit-to-mri-join)
 6. 🏷️ [The diagnosis rules](#6-the-diagnosis-rules)
 7. 🟢 [Feature sets](#7-feature-sets)
@@ -142,6 +143,46 @@ flowchart LR
 | Synthetic data | `src/dementia_typer/synthetic.py` | OASIS-3-like tables with progression and CDR leakage |
 | CLI | `src/dementia_typer/cli.py` | `synth`, `validate`, `train`, `ablation`, `leakage`, `predict`, `demo` |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>7 commands"]
+    CFG["config.py<br/>Settings.from_env"]
+    subgraph DATA["Data"]
+        SYN["synthetic.py<br/>write"]
+        DAT["data.py<br/>load_tables, join_visits, build_table"]
+        LAB["labels.py<br/>CLASSES, RULES, map_diagnosis"]
+        FEA["features.py<br/>make_features, FEATURE_SETS"]
+    end
+    subgraph LEARN["Training and evaluation"]
+        TRN["train.py<br/>run_experiment, leakage_check, save, load"]
+        MOD["modeling.py<br/>holdout_split, inner_search, nested_cv"]
+        EVA["evaluate.py<br/>metrics, subject_bootstrap"]
+    end
+    subgraph USE["Use"]
+        PRE["predict.py<br/>Visit, predict_visit"]
+        EXP["explain.py<br/>shap_values, optional"]
+    end
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> DAT
+    CLI --> LAB
+    CLI --> TRN
+    CLI --> PRE
+    DAT --> LAB
+    FEA --> DAT
+    TRN --> FEA
+    TRN --> LAB
+    TRN --> MOD
+    TRN --> EVA
+    EVA --> LAB
+    PRE --> FEA
+    PRE --> EVA
+    PRE --> LAB
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -186,6 +227,16 @@ dementia-typer/
 
 Clinicians use the CDR boxes, `CDRSUM` and `CDRTOT` to assign the diagnosis. `features.py` puts them only in feature set `C`. The model card of a set `C` bundle has a warning that its result is a leakage ceiling.
 
+```mermaid
+flowchart LR
+    A["Set A<br/>demographics + 10 MRI columns"] --> B["Set B<br/>A + MMSE"]
+    B --> C["Set C<br/>B + 6 CDR boxes, CDRSUM, CDRTOT"]
+    A --> MAIN[/"Main model result"/]
+    B --> REF[/"Result with a short cognitive test"/]
+    C --> CHK{"LEAKAGE_FEATURES<br/>in the features?"}
+    CHK -- "yes" --> WARN[/"Model card warning:<br/>leakage ceiling, not a valid estimate"/]
+```
+
 ### 3.2 One participant, one side of each split
 
 `modeling.holdout_split` holds out whole participants, stratified by the group of their last visit. The inner search uses `GroupKFold` on `OASISID`. `assert_disjoint` stops the run if a participant is on both sides.
@@ -217,24 +268,66 @@ The imputer, the scaler and the selector are steps of one scikit-learn `Pipeline
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    C["clinical.csv"] --> VC["validate_clinical"]
-    M["freesurfer.csv"] --> VM["validate_mri + QC filter"]
-    D["demographics.csv"] --> VD["validate_demographics"]
-    VC & VM & VD --> J["join_visits (nearest MR session in window)"]
+flowchart TD
+    C[/"clinical.csv"/] --> VC["validate_clinical"]
+    M[/"freesurfer.csv"/] --> VM["validate_mri + QC filter"]
+    D[/"demographics.csv"/] --> VD["validate_demographics"]
+    VC --> J["join_visits (nearest MR session in window)"]
+    VM --> J
+    VD --> J
     J --> L["map_diagnosis: dx1 to group"]
-    L --> F["make_features + feature set"]
+    L --> UM{"validate: any dx1 text<br/>with no rule?"}
+    UM -- "yes, exit code 2" --> HR{{"HUMAN<br/>review the text, extend labels.RULES"}}
+    L -- "visits with a group" --> F["make_features + feature set"]
     F --> H["holdout_split by participant"]
     H --> IS["inner_search (GroupKFold, macro-F1)"]
     H --> NC["nested_cv (optional)"]
     IS --> EV["evaluate once on hold-out participants"]
-    EV --> B["bundle + metrics.json + model card"]
+    EV --> B[("runs/set_X/<br/>model.joblib, metrics.json, model_card.md")]
+    VJ[/"Visit JSON"/] --> P
     B --> P["predict_visit (pydantic Visit)"]
+    P --> OUT[/"Group probabilities and imputed features"/]
+    OUT --> HC{{"HUMAN<br/>a clinician makes the diagnosis"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HR,HC human
 ```
 
 ### 4.2 The life cycle of one visit
 
-1. `validate_clinical` reads the visit row and checks the key, the age and the MMSE range.
+```mermaid
+stateDiagram-v2
+    state "Raw visit row" as Raw
+    state "Validated visit" as Valid
+    state "Visit with MRI volumes" as WithMRI
+    state "Visit with empty volumes" as NoMRI
+    state "Visit with a group" as Grouped
+    state "Left out, no group" as Unmapped
+    state "Feature row" as Featured
+    state "Training participant" as Train
+    state "Hold-out participant" as Test
+    state "Five group probabilities" as Scored
+    [*] --> Raw
+    Raw --> SchemaError: column absent, visit not unique, MMSE out of range
+    Raw --> Valid: validate_clinical
+    Valid --> WithMRI: passed MR session within the window
+    Valid --> NoMRI: no MR session within the window
+    WithMRI --> Grouped: map_diagnosis
+    NoMRI --> Grouped: map_diagnosis
+    WithMRI --> Unmapped: no rule matches dx1
+    NoMRI --> Unmapped: no rule matches dx1
+    Grouped --> Featured: make_features
+    Featured --> Train: holdout_split, with its participant
+    Featured --> Test: holdout_split, with its participant
+    Train --> Train: inner_search selects the candidate
+    Test --> Scored: selected pipeline, once
+    Scored --> [*]
+    Train --> [*]
+    Unmapped --> [*]
+    SchemaError --> [*]
+```
+
+1. `validate_clinical` reads the visit row and checks the required columns, the key and the MMSE range.
 2. `join_visits` attaches the nearest passed MR session of the same participant within 365 days.
 3. `map_diagnosis` changes the `dx1` text into a group. If no rule matches, the visit leaves the analysis.
 4. `make_features` divides each volume by the intracranial volume and adds the demographic values.
@@ -242,11 +335,68 @@ flowchart TB
 6. If the visit is in training, it helps the inner search to select a candidate.
 7. If the visit is in the test, the selected pipeline gives five group probabilities for it.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AN as Analyst
+    participant CLI as dementia-typer CLI
+    participant DAT as data.py
+    participant TRN as train.py
+    participant MOD as modeling.py
+    participant FS as runs/ folder
+    participant PRE as predict.py
+
+    AN->>CLI: dementia-typer train --data data/oasis3 --feature-set A --nested
+    CLI->>CLI: Settings.from_env
+    CLI->>DAT: build_table(data, join_window_days)
+    DAT->>DAT: load_tables, validate_*, join_visits, map_series
+    DAT-->>CLI: visit table with group
+    CLI->>TRN: run_experiment(table, A, models, selectors, k, seed)
+    TRN->>MOD: holdout_split by participant
+    TRN->>MOD: nested_cv on training participants (--nested)
+    TRN->>MOD: inner_search: GridSearchCV with GroupKFold
+    MOD-->>TRN: best pipeline, chosen candidate, search log
+    TRN->>TRN: metrics on hold-out, subject_bootstrap, majority baseline, permutation importance
+    TRN-->>CLI: Experiment
+    CLI->>FS: save: model.joblib, metrics.json, model_card.md
+    CLI-->>AN: test metrics and paths
+    AN->>CLI: dementia-typer predict --model model.joblib --input visit.json
+    CLI->>TRN: load: check the class list
+    CLI->>PRE: predict_visit(bundle, payload)
+    PRE->>PRE: Visit.model_validate, make_features in bundle order
+    PRE-->>CLI: prediction, probabilities, imputed_features, note
+    CLI-->>AN: JSON result
+    AN->>AN: a clinician makes the diagnosis
+```
+
 ---
 
 ## 5. Tables and the visit-to-MRI join
 
 **Purpose.** Make one row for each clinical visit with the MRI volumes of a close MR session.
+
+```mermaid
+flowchart TD
+    CL[/"clinical.csv"/] --> DV{"days_to_visit column?"}
+    DV -- "no" --> LBL["day_from_label:<br/>suffix _dNNNN"]
+    DV -- "yes" --> VC
+    LBL --> VC["validate_clinical: required columns,<br/>unique visits, MMSE 0 to 30"]
+    FS[/"freesurfer.csv, optional"/] --> VM["validate_mri: required columns,<br/>IntraCranialVol positive"]
+    VM --> QC{"FS QC Status column?"}
+    QC -- "yes" --> QF["Keep passed, pass, ok"]
+    QC -- "no" --> J
+    QF --> J["merge_asof by OASISID: nearest session,<br/>tolerance DEMENTIA_JOIN_WINDOW_DAYS"]
+    VC --> J
+    J --> GAP["scan_gap_days"]
+    DM[/"demographics.csv, optional"/] --> VD["validate_demographics:<br/>unique OASISID"]
+    GAP --> MD["Merge demographics on OASISID"]
+    VD --> MD
+    MD --> MAP["map_series: dx1 to group"]
+    MAP --> OUT[/"Visit table"/]
+    VC -- "problem" --> ERR[/"SchemaError, exit code 1"/]
+```
 
 | Input | Output |
 |---|---|
@@ -271,10 +421,30 @@ flowchart TB
 
 **Purpose.** Map each `dx1` text to one group, or to no group.
 
+```mermaid
+flowchart TD
+    IN[/"dx1 text"/] --> E{"Empty or missing?"}
+    E -- "yes" --> NONE[/"No group:<br/>listed by validate"/]
+    E -- "no" --> NORM["normalize: strip, lower case,<br/>one space"]
+    NORM --> R1{"Rule 1: MCI patterns?"}
+    R1 -- "yes" --> G1[/"MCI"/]
+    R1 -- "no" --> R2{"Rule 2: Normal patterns?"}
+    R2 -- "yes" --> G2[/"Normal"/]
+    R2 -- "no" --> R3{"Rule 3: non ad?"}
+    R3 -- "yes" --> G3[/"Other dementia"/]
+    R3 -- "no" --> R4{"Rule 4: vascular, vad?"}
+    R4 -- "yes" --> G4[/"Vascular"/]
+    R4 -- "no" --> R5{"Rule 5: ad, dat, alzheimer?"}
+    R5 -- "yes" --> G5[/"Alzheimer's"/]
+    R5 -- "no" --> R6{"Rule 6: other dementia patterns?"}
+    R6 -- "yes" --> G3
+    R6 -- "no" --> NONE
+```
+
 | Order | Group | Pattern (on lower-case text) | Examples |
 |---|---|---|---|
 | 1 | MCI | `uncertain`, `incipient`, `0.5 in memory`, `ques. impair`, `questionable`, `impair reversible`, `mci`, `mild cognitive`, `w/o dement` | "0.5 in memory only", "uncertain- possible NON AD dem" |
-| 2 | Normal | `cognitively normal`, `no dementia`, `normal` | "Cognitively normal" |
+| 2 | Normal | `cognitively normal`, `no dementia`, `normal` (the full text only) | "Cognitively normal" |
 | 3 | Other dementia | `non ad`, `non-ad`, `nonad` | "Non AD dem- Other primary" |
 | 4 | Vascular | `vascular`, `vad` | "Vascular Demt- primary" |
 | 5 | Alzheimer's | `ad`, `dat`, `alzheimer` (whole words) | "AD Dementia", "DAT" |
@@ -285,6 +455,25 @@ The first rule that matches wins. The rules use word boundaries, so "headache" d
 ---
 
 ## 7. Feature sets
+
+```mermaid
+flowchart LR
+    T[/"Visit table"/] --> AGE["age = age at visit"]
+    T --> SEX["sex_male: M 1, F 0, else NaN"]
+    T --> EDU["education_years"]
+    T --> ICV["icv_l = IntraCranialVol / 1,000,000"]
+    T --> VOL["9 volumes: volume / IntraCranialVol<br/>x 1000, per mille"]
+    T --> COG["MMSE and CDR columns as numbers,<br/>NaN if absent"]
+    AGE --> MF["make_features"]
+    SEX --> MF
+    EDU --> MF
+    ICV --> MF
+    VOL --> MF
+    COG --> MF
+    MF --> CF{"columns_for: set A, B or C"}
+    CF -- "other value" --> ERR[/"ValueError"/]
+    CF -- "A, B or C" --> X[/"Feature matrix X"/]
+```
 
 | Set | Columns | Use |
 |---|---|---|
@@ -299,6 +488,22 @@ The 9 volumes: `TotalGrayVol`, `CortexVol`, `CorticalWhiteMatterVol`, `SubCortGr
 ## 8. Participant splits and model selection
 
 **Purpose.** Select one pipeline with the training participants only, and keep the test participants for one final measurement.
+
+```mermaid
+flowchart TD
+    IN[/"Labelled visits, X, y, OASISID"/] --> SL["subject_labels: group of the last visit"]
+    SL --> RS["Groups with fewer than 5 participants<br/>share one stratum"]
+    RS --> HO["StratifiedKFold of participants,<br/>first fold is the hold-out, about 20%"]
+    HO --> DJ{"assert_disjoint:<br/>participant on both sides?"}
+    DJ -- "yes" --> LE[/"LeakageError"/]
+    DJ -- "no" --> NS{"--nested?"}
+    NS -- "yes" --> NCV["nested_cv: StratifiedGroupKFold outer folds,<br/>inner_search with 3 folds in each"]
+    NS -- "no" --> IS
+    NCV --> IS["inner_search: for each candidate,<br/>GridSearchCV with GroupKFold, f1_macro"]
+    IS --> BEST["Highest inner macro-F1,<br/>refit on all training participants"]
+    BEST --> TEST["Predict the hold-out<br/>participants once"]
+    TEST --> OUT[/"Experiment"/]
+```
 
 | Input | Output |
 |---|---|
@@ -329,6 +534,25 @@ The 9 volumes: `TotalGrayVol`, `CortexVol`, `CorticalWhiteMatterVol`, `SubCortGr
 
 ## 9. Evaluation and explanations
 
+```mermaid
+flowchart TD
+    P[/"Pipeline probabilities"/] --> FP["full_proba: columns in CLASSES order,<br/>0 for a class the model never saw"]
+    Y[/"True groups of the test visits"/] --> M["metrics"]
+    FP --> M
+    M --> PRES["macro_f1 and balanced_accuracy<br/>on the groups that occur"]
+    M --> RC["recall, precision, support,<br/>absent_classes, confusion_matrix"]
+    M --> CAL["brier, top-label ece with 10 bins"]
+    M --> AUC["auroc_ovr for each group with<br/>both values, macro_auroc_ovr"]
+    FP --> BS["subject_bootstrap: draw whole participants,<br/>200 draws, 2.5 and 97.5 percentiles"]
+    FP --> PI["permutation_importance on the test<br/>participants, f1_macro, 3 repeats"]
+    PRES --> OUT[/"test, ci, importance"/]
+    RC --> OUT
+    CAL --> OUT
+    AUC --> OUT
+    BS --> OUT
+    PI --> OUT
+```
+
 | Metric | Meaning |
 |---|---|
 | `macro_f1` | Mean F1 over the groups that occur in the test. The main metric |
@@ -349,6 +573,17 @@ Permutation importance shuffles one feature at a time on the test participants a
 
 `leakage_check` trains one fixed forest on feature set `A` two times:
 
+```mermaid
+flowchart LR
+    T[/"Labelled visits, set A"/] --> VS["train_test_split by visit,<br/>stratified, 20% test"]
+    T --> PS["holdout_split by participant"]
+    VS --> F1["Forest fit and macro-F1"]
+    PS --> F2["Forest fit and macro-F1"]
+    F1 --> GAP["gap = visit_split - participant_split"]
+    F2 --> GAP
+    GAP --> OUT[/"visit_split, participant_split, gap"/]
+```
+
 1. With a visit-level stratified split, where one participant can be in training and test.
 2. With the participant-level hold-out split.
 
@@ -359,6 +594,27 @@ The difference of the two macro-F1 values shows how much a visit-level split ove
 ## 11. Bundles, model cards and prediction
 
 `train.save` writes three files:
+
+```mermaid
+flowchart TD
+    EXP[/"Experiment"/] --> SV["train.save"]
+    SV --> B[("model.joblib, metrics.json,<br/>model_card.md")]
+    B --> LD["train.load"]
+    LD --> CL{"Same CLASSES list?"}
+    CL -- "no" --> E1[/"ValueError, exit code 1"/]
+    CL -- "yes" --> V{"Visit.model_validate:<br/>known fields, values in range?"}
+    J[/"Visit JSON"/] --> V
+    V -- "no" --> E2[/"ValidationError, exit code 1"/]
+    V -- "yes" --> MF["make_features, columns<br/>in the bundle order"]
+    MF --> IM["imputed_features: empty columns"]
+    MF --> PR["pipeline.predict_proba, full_proba"]
+    PR --> OUT[/"prediction, 5 probabilities,<br/>feature_set, note"/]
+    IM --> OUT
+    OUT --> HUMAN{{"HUMAN<br/>a clinician makes the diagnosis"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
+```
 
 | File | Contents |
 |---|---|
@@ -432,6 +688,15 @@ pip install -e ".[dev]"         # add ,explain for SHAP
 
 Offline demo (synthetic data, about three minutes on a laptop):
 
+```mermaid
+flowchart LR
+    S["synthetic.write<br/>300 participants, seed 0,<br/>temporary folder"] --> V["cmd_validate"]
+    V --> B["build_table"]
+    B --> L["leakage_check, set A"]
+    L --> E["run_experiment for sets A, B, C,<br/>200 bootstrap draws"]
+    E --> P[/"Metrics of each set on the console"/]
+```
+
 ```bash
 dementia-typer demo
 ```
@@ -468,13 +733,13 @@ Example `visit.json`:
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `DEMENTIA_DATA_DIR` | `config.Settings` | Default data folder (default `data/oasis3`) |
+| `DEMENTIA_DATA_DIR` | `config.Settings` | Data folder in `Settings.data_dir` (default `data/oasis3`). No command reads it: each command that reads data needs `--data` |
 | `DEMENTIA_OUTPUT_DIR` | `train` | Run folder (default `runs`) |
 | `DEMENTIA_SEED` | splits, models, bootstrap | Seed (default 42) |
 | `DEMENTIA_JOIN_WINDOW_DAYS` | `join_visits` | Maximum visit-to-scan distance (default 365) |
 | `DEMENTIA_N_SPLITS` | inner and nested CV | Number of grouped folds (default 5, minimum 2) |
 
-dementia-typer needs no credentials. `.env.example` gives the variable names. Git ignores `.env`.
+dementia-typer needs no credentials. `.env.example` gives the variable names. Git ignores `.env`. dementia-typer does not load `.env` itself. Set the variables in the shell before you run a command.
 
 ---
 
